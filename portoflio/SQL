@@ -1,0 +1,350 @@
+-- =============================================================================
+-- PROJECT   : Customer Churn Analysis, RFM & Segmentation
+-- TOOL      : BigQuery (Google BigQuery Standard SQL)
+-- DATASET   : online_retail (541,909 transactional records, Dec 2010 – Dec 2011)
+-- AUTHOR    : Reta Tri Asriani
+-- =============================================================================
+
+-- =============================================================================
+-- STEP 0: DATA QUALITY CHECK
+-- =============================================================================
+-- Finding:
+--   Raw dataset contains 541,909 rows with several data quality issues:
+--   - 135,080 rows (24.9%) have NULL CustomerID → cannot be used for customer analysis
+--   - 9,288 rows are cancelled transactions (InvoiceNo prefix 'C') → excluded
+--   - 10,624 rows have Quantity <= 0 → excluded
+--   - 2,517 rows have UnitPrice <= 0 → excluded
+--   After cleaning: 397,884 valid rows | 4,338 unique customers
+-- =============================================================================
+
+SELECT
+  COUNT(*) AS total_rows,
+  COUNTIF(CustomerID IS NULL) AS null_customer_id,
+  COUNTIF(CAST(InvoiceNo AS STRING) LIKE 'C%') AS cancelled_transactions,
+  COUNTIF(Quantity <= 0) AS invalid_quantity,
+  COUNTIF(UnitPrice <= 0) AS invalid_price,
+  COUNT(DISTINCT CustomerID) AS unique_customers_raw
+FROM `project_2.online_retail`;
+
+
+-- =============================================================================
+-- STEP 1: DATA CLEANING
+-- =============================================================================
+-- Cleaning steps applied:
+--   1. Remove cancelled transactions (InvoiceNo starts with 'C')
+--   2. Remove rows with NULL CustomerID
+--   3. Remove rows with Quantity <= 0
+--   4. Remove rows with UnitPrice <= 0
+--   5. Add TotalPrice column (Quantity × UnitPrice)
+-- =============================================================================
+
+CREATE OR REPLACE TABLE `project_2.online_retail_clean` AS
+SELECT
+  InvoiceNo,
+  StockCode,
+  Description,
+  Quantity,
+  InvoiceDate,
+  UnitPrice,
+  CAST(CustomerID AS INT64) AS CustomerID,
+  Country,
+  ROUND(Quantity * UnitPrice, 2) AS TotalPrice
+FROM `project_2.online_retail`
+WHERE
+  CAST(InvoiceNo AS STRING) NOT LIKE 'C%'
+  AND CustomerID IS NOT NULL
+  AND Quantity > 0
+  AND UnitPrice > 0;
+
+
+-- Validate cleaning result
+SELECT
+  COUNT(*) AS total_clean_rows,
+  COUNT(DISTINCT CustomerID) AS unique_customers,
+  COUNT(DISTINCT InvoiceNo) AS unique_invoices,
+  COUNT(DISTINCT Country) AS countries,
+  MIN(InvoiceDate) AS earliest_date,
+  MAX(InvoiceDate) AS latest_date,
+  ROUND(SUM(TotalPrice), 2) AS total_revenue
+FROM `project_2.online_retail_clean`;
+
+
+-- =============================================================================
+-- STEP 2: EXPLORATORY DATA ANALYSIS (EDA)
+-- =============================================================================
+
+-- 2a. Overview KPIs
+-- Analysis:
+--   After cleaning, dataset covers 1 full year (Dec 2010 – Dec 2011) of UK-based
+--   e-commerce transactions with total revenue of £8,911,407.90 across 4,338 customers.
+-- =============================================================================
+SELECT
+  COUNT(DISTINCT CustomerID) AS total_customers,
+  COUNT(DISTINCT InvoiceNo) AS total_orders,
+  COUNT(DISTINCT StockCode) AS total_products,
+  ROUND(SUM(TotalPrice), 2) AS total_revenue,
+  ROUND(AVG(TotalPrice), 2) AS avg_order_value,
+  MIN(InvoiceDate) AS first_transaction,
+  MAX(InvoiceDate) AS last_transaction
+FROM `project_2.online_retail_clean`;
+
+
+-- 2b. Monthly Revenue Trend
+-- Analysis:
+--   Revenue grows steadily from Dec 2010, peaks in Nov 2011 (£1.16M), then
+--   drops sharply in Dec 2011 (partial month data — only 9 days).
+-- =============================================================================
+WITH monthly_sales AS (
+  SELECT
+    FORMAT_DATETIME('%Y-%m', InvoiceDate) AS month,
+    ROUND(SUM(TotalPrice), 2) AS total_revenue,
+    COUNT(DISTINCT InvoiceNo) AS total_orders,
+    COUNT(DISTINCT CustomerID) AS active_customers
+  FROM `project_2.online_retail_clean`
+  GROUP BY month
+)
+SELECT
+  *,
+  LAG(total_revenue) OVER (ORDER BY month) AS prev_month_revenue,
+  ROUND(
+    (total_revenue - LAG(total_revenue) OVER (ORDER BY month))
+    * 100.0 / NULLIF(LAG(total_revenue) OVER (ORDER BY month), 0), 2
+  ) AS mom_growth_pct
+FROM monthly_sales
+ORDER BY month;
+
+
+-- 2c. Revenue by Country (Top 10)
+-- Analysis:
+--   United Kingdom dominates with 82% of total revenue (£7.3M).
+--   Netherlands, EIRE, Germany, France follow as secondary markets.
+-- =============================================================================
+SELECT
+  Country,
+  COUNT(DISTINCT CustomerID) AS customers,
+  COUNT(DISTINCT InvoiceNo) AS orders,
+  ROUND(SUM(TotalPrice), 2) AS total_revenue,
+  ROUND(SUM(TotalPrice) * 100.0 / SUM(SUM(TotalPrice)) OVER (), 2) AS revenue_pct
+FROM `project_2.online_retail_clean`
+GROUP BY Country
+ORDER BY total_revenue DESC
+LIMIT 10;
+
+
+-- =============================================================================
+-- STEP 3: RFM CALCULATION
+-- =============================================================================
+-- RFM Definitions:
+--   Recency   = Days since last purchase (from snapshot date: 2011-12-10)
+--               Lower is better → customer purchased recently
+--   Frequency = Number of unique invoices per customer
+--               Higher is better → customer purchases often
+--   Monetary  = Total spend per customer (£)
+--               Higher is better → customer spends more
+--
+-- Result:
+--   Avg Recency: 92.5 days | Avg Frequency: 4.3 orders | Avg Monetary: £2,054
+-- =============================================================================
+
+CREATE OR REPLACE TABLE `project_2.rfm_base` AS
+WITH snapshot AS (
+  SELECT DATETIME_ADD(MAX(InvoiceDate), INTERVAL 1 DAY) AS snapshot_date
+  FROM `project_2.online_retail_clean`
+)
+SELECT
+  c.CustomerID,
+  c.Country,
+  DATE_DIFF(DATE(s.snapshot_date), DATE(MAX(c.InvoiceDate)), DAY) AS Recency,
+  COUNT(DISTINCT c.InvoiceNo) AS Frequency,
+  ROUND(SUM(c.TotalPrice), 2) AS Monetary
+FROM `project_2.online_retail_clean` c
+CROSS JOIN snapshot s
+GROUP BY c.CustomerID, c.Country, s.snapshot_date;
+
+-- =============================================================================
+-- STEP 4: RFM SCORING (1–5)
+-- =============================================================================
+-- Scoring logic using NTILE(5):
+--   Recency  : Score 5 = most recent (lowest days), Score 1 = least recent
+--   Frequency: Score 5 = most frequent, Score 1 = least frequent
+--   Monetary : Score 5 = highest spend, Score 1 = lowest spend
+-- =============================================================================
+
+CREATE OR REPLACE TABLE `project_2.rfm_scored` AS
+WITH rfm_scores AS (
+  SELECT
+    CustomerID,
+    Country,
+    Recency,
+    Frequency,
+    Monetary,
+    -- Recency: lower days = better = higher score
+    6 - NTILE(5) OVER (ORDER BY Recency ASC) AS R_Score,
+    NTILE(5) OVER (ORDER BY Frequency ASC) AS F_Score,
+    NTILE(5) OVER (ORDER BY Monetary ASC) AS M_Score
+  FROM `project_2.rfm_base`
+)
+SELECT
+  *,
+  CONCAT(CAST(R_Score AS STRING),
+         CAST(F_Score AS STRING),
+         CAST(M_Score AS STRING)) AS RFM_Score,
+  R_Score + F_Score + M_Score AS RFM_Total
+FROM rfm_scores;
+
+
+-- =============================================================================
+-- STEP 5: CUSTOMER SEGMENTATION
+-- =============================================================================
+-- Segment definitions based on R, F, M scores:
+--
+--   Champions        : R>=4, F>=4, M>=4 → Best customers, buy often, spend most
+--   Loyal Customers  : R>=3, F>=3       → Regular buyers, solid value
+--   Potential Loyalis: R>=4, F<=2       → Recent buyers, not yet frequent
+--   Promising        : R>=3, F<=2       → Somewhat recent, early stage
+--   At Risk          : R<=2, F>=3, M>=3 → Used to buy often but going quiet
+--   Cant Lose Them   : R=1,  F>=4       → High frequency but very inactive
+--   Hibernating      : R<=2, F<=2, M>=3 → Low activity, decent past spend
+--   Lost             : All others       → Low R, F, M — likely churned
+--
+-- Key findings:
+--   Champions (22.2%) drive 65.2% of revenue — most critical segment to retain
+--   Lost (23.1%) is the largest segment but contributes only 2.7% of revenue
+--   At Risk (10.5%) represents £742,150 in revenue at risk
+-- =============================================================================
+
+CREATE OR REPLACE TABLE `project_2.rfm_segmented` AS
+SELECT
+  *,
+  CASE
+    WHEN R_Score >= 4 AND F_Score >= 4 AND M_Score >= 4  THEN 'Champions'
+    WHEN R_Score >= 3 AND F_Score >= 3 THEN 'Loyal Customers'
+    WHEN R_Score >= 4 AND F_Score <= 2 THEN 'Potential Loyalists'
+    WHEN R_Score >= 3 AND F_Score <= 2 THEN 'Promising'
+    WHEN R_Score <= 2 AND F_Score >= 3 AND M_Score >= 3  THEN 'At Risk'
+    WHEN R_Score = 1  AND F_Score >= 4 THEN 'Cant Lose Them'
+    WHEN R_Score <= 2 AND F_Score <= 2 AND M_Score >= 3  THEN 'Hibernating'
+    ELSE                                                      'Lost'
+  END AS Segment
+FROM `project_2.rfm_scored`;
+
+
+-- Segment summary — size and revenue contribution
+SELECT
+  Segment,
+  COUNT(CustomerID) AS customer_count,
+  ROUND(COUNT(CustomerID) * 100.0 / SUM(COUNT(CustomerID)) OVER(), 1) AS pct_customers,
+  ROUND(AVG(Recency), 1) AS avg_recency_days,
+  ROUND(AVG(Frequency), 1) AS avg_frequency,
+  ROUND(AVG(Monetary), 2) AS avg_monetary,
+  ROUND(SUM(Monetary), 2) AS total_revenue,
+  ROUND(SUM(Monetary) * 100.0 / SUM(SUM(Monetary)) OVER(), 1) AS pct_revenue
+FROM `project_2.rfm_segmented`
+GROUP BY Segment
+ORDER BY total_revenue DESC;
+
+
+-- =============================================================================
+-- STEP 6: CHURN ANALYSIS
+-- =============================================================================
+-- Churn Definition:
+--   A customer is considered CHURNED if their last purchase was more than
+--   90 days before the snapshot date (2011-12-10).
+--   This threshold aligns with typical e-commerce churn benchmarks.
+--
+-- Key findings:
+--   Overall churn rate: 33.4% (1,449 out of 4,338 customers)
+--   Revenue at risk from churned customers: £1,035,270 (11.6% of total)
+--   At Risk segment: 75.6% churn rate → highest priority for win-back campaigns
+-- =============================================================================
+
+-- 6a. Overall churn metrics
+WITH churn_flagged AS (
+  SELECT
+    *,
+    CASE WHEN Recency > 90 THEN 1 ELSE 0 END AS Is_Churned
+  FROM `project_2.rfm_segmented`
+)
+SELECT
+  COUNT(CustomerID) AS total_customers,
+  SUM(Is_Churned) AS churned_customers,
+  COUNT(CustomerID) - SUM(Is_Churned) AS active_customers,
+  ROUND(SUM(Is_Churned) * 100.0 / COUNT(CustomerID), 1) AS churn_rate_pct,
+  ROUND(SUM(CASE WHEN Is_Churned = 1 THEN Monetary END), 2) AS revenue_at_risk,
+  ROUND(
+    SUM(CASE WHEN Is_Churned = 1 THEN Monetary END) * 100.0
+    / SUM(Monetary), 1
+  ) AS pct_revenue_at_risk
+FROM churn_flagged;
+
+
+-- 6b. Churn rate by segment
+WITH churn_flagged AS (
+  SELECT
+    *,
+    CASE WHEN Recency > 90 THEN 1 ELSE 0 END AS Is_Churned
+  FROM `project_2.rfm_segmented`
+)
+SELECT
+  Segment,
+  COUNT(CustomerID) AS total_customers,
+  SUM(Is_Churned) AS churned_customers,
+  ROUND(SUM(Is_Churned) * 100.0 / COUNT(CustomerID), 1) AS churn_rate_pct,
+  ROUND(SUM(CASE WHEN Is_Churned = 1 THEN Monetary END), 2) AS revenue_at_risk
+FROM churn_flagged
+GROUP BY Segment
+ORDER BY churn_rate_pct DESC;
+
+
+-- 6c. High-value churned customers (At Risk + Cant Lose Them with Monetary >= avg)
+-- These are the highest priority customers for win-back campaigns
+WITH churn_flagged AS (
+  SELECT
+    *,
+    CASE WHEN Recency > 90 THEN 1 ELSE 0 END AS Is_Churned
+  FROM `project_2.rfm_segmented`
+)
+SELECT
+  CustomerID,
+  Country,
+  Segment,
+  Recency AS days_since_last_purchase,
+  Frequency AS total_orders,
+  ROUND(Monetary, 2)  AS total_spend,
+  RFM_Score
+FROM churn_flagged
+WHERE
+  Is_Churned = 1
+  AND Segment IN ('At Risk', 'Cant Lose Them')
+  AND Monetary >= 1000
+ORDER BY Monetary DESC
+LIMIT 20;
+
+
+-- =============================================================================
+-- STEP 7: BUSINESS SUMMARY — Actionable Segment Overview
+-- =============================================================================
+-- Final combined view for dashboard and reporting
+-- =============================================================================
+
+SELECT
+  Segment,
+  COUNT(CustomerID) AS customers,
+  ROUND(AVG(Recency)) AS avg_recency,
+  ROUND(AVG(Frequency), 1) AS avg_frequency,
+  ROUND(AVG(Monetary), 0) AS avg_monetary,
+  ROUND(SUM(Monetary), 0) AS segment_revenue,
+  ROUND(SUM(Monetary) * 100.0 / SUM(SUM(Monetary)) OVER(), 1) AS revenue_pct,
+  CASE
+    WHEN Segment = 'Champions' THEN '🏆 Reward & retain — highest value'
+    WHEN Segment = 'Loyal Customers' THEN '💙 Upsell & cross-sell opportunities'
+    WHEN Segment = 'Potential Loyalists' THEN '🌱 Nurture into loyal buyers'
+    WHEN Segment = 'Promising' THEN '📣 Onboarding & engagement campaigns'
+    WHEN Segment = 'At Risk' THEN '⚠️ Win-back urgently — high revenue at risk'
+    WHEN Segment = 'Cant Lose Them' THEN '🚨 Immediate re-engagement required'
+    WHEN Segment = 'Hibernating'THEN '😴 Low-cost reactivation campaigns'
+    WHEN Segment = 'Lost' THEN '❌ Low priority — survey for exit feedback'
+  END                                                             AS recommended_action
+FROM `project_2.rfm_segmented`
+GROUP BY Segment
+ORDER BY segment_revenue DESC;
