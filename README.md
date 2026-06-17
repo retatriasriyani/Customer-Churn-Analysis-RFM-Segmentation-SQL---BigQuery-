@@ -182,7 +182,7 @@ A customer is defined as **churned** if their most recent purchase occurred **mo
 
 ## Interactive Dashboard
 
-> [*Looker Studio dashboard link — coming soon*](https://datastudio.google.com/reporting/49096c50-dac4-4ef3-8b0d-fb3606736d12)
+> [*Looker Studio dashboard link*](https://datastudio.google.com/reporting/49096c50-dac4-4ef3-8b0d-fb3606736d12)
 
 ---
 
